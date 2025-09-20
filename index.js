@@ -76,26 +76,111 @@ function pickFormats(formats) {
   return null;
 }
 
-// Download file from URL
-async function downloadFile(url, filePath) {
-  console.log(`Downloading: ${path.basename(filePath)}`);
-  const response = await axios({
-    method: 'GET',
-    url: url,
-    responseType: 'stream',
-    timeout: 300000, // 5 minutes timeout
-  });
-
-  const writer = fs.createWriteStream(filePath);
-  response.data.pipe(writer);
-
+// Download file using yt-dlp (more reliable for Bilibili)
+async function downloadFileWithYtDlp(url, filePath) {
   return new Promise((resolve, reject) => {
-    writer.on('finish', () => {
-      console.log(`Downloaded: ${path.basename(filePath)}`);
-      resolve();
-    });
-    writer.on('error', reject);
+    console.log(`Downloading with yt-dlp: ${path.basename(filePath)}`);
+    console.log(`URL: ${url}`);
+    
+    execFile(
+      'python',
+      [
+        '-m', 'yt_dlp',
+        '--no-warnings',
+        '--no-check-certificates',
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        '--referer', 'https://www.bilibili.tv/',
+        '--output', filePath,
+        url
+      ],
+      { maxBuffer: 1024 * 1024 * 10 },
+      (err, stdout, stderr) => {
+        if (err) {
+          console.error(`yt-dlp download error for ${path.basename(filePath)}:`, err.message);
+          console.error('stderr:', stderr);
+          return reject(new Error(`yt-dlp download failed: ${err.message}`));
+        }
+        console.log(`Downloaded with yt-dlp: ${path.basename(filePath)}`);
+        resolve();
+      }
+    );
   });
+}
+
+// Download file from URL with retry logic and proper headers
+async function downloadFile(url, filePath, retries = 3) {
+  console.log(`Downloading: ${path.basename(filePath)}`);
+  console.log(`URL: ${url}`);
+  
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Referer': 'https://www.bilibili.tv/',
+    'Origin': 'https://www.bilibili.tv',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'cross-site',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache'
+  };
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log(`Attempt ${attempt}/${retries} for ${path.basename(filePath)}`);
+      
+      const response = await axios({
+        method: 'GET',
+        url: url,
+        responseType: 'stream',
+        timeout: 300000, // 5 minutes timeout
+        headers: headers,
+        maxRedirects: 5,
+        validateStatus: function (status) {
+          return status >= 200 && status < 300; // Only resolve for 2xx status codes
+        }
+      });
+
+      const writer = fs.createWriteStream(filePath);
+      response.data.pipe(writer);
+
+      return new Promise((resolve, reject) => {
+        writer.on('finish', () => {
+          console.log(`Downloaded: ${path.basename(filePath)}`);
+          resolve();
+        });
+        writer.on('error', (err) => {
+          console.error(`Write error for ${path.basename(filePath)}:`, err.message);
+          reject(err);
+        });
+        
+        response.data.on('error', (err) => {
+          console.error(`Stream error for ${path.basename(filePath)}:`, err.message);
+          reject(err);
+        });
+      });
+    } catch (error) {
+      console.error(`Download error for ${path.basename(filePath)} (attempt ${attempt}):`, error.message);
+      
+      if (error.response) {
+        console.error(`HTTP Status: ${error.response.status}`);
+        if (error.response.status === 403) {
+          console.error('403 Forbidden - This might be due to missing authentication or blocked access');
+        }
+        if (error.response.data) {
+          console.error(`Response data:`, error.response.data);
+        }
+      }
+      
+      if (attempt === retries) {
+        throw error;
+      } else {
+        console.log(`Retrying in ${attempt * 2} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, attempt * 2000));
+      }
+    }
+  }
 }
 
 // Merge video and audio using ffmpeg
@@ -187,11 +272,37 @@ async function cleanupFiles(filePaths) {
       const tempFiles = [videoFile, audioFile];
       
       try {
-        // Download video and audio files
-        await Promise.all([
-          downloadFile(v.url, videoFile),
-          downloadFile(a.url, audioFile)
-        ]);
+        // Download video and audio files with individual error handling
+        console.log('Starting downloads...');
+        
+        const downloadPromises = [];
+        
+        // Download video (try axios first)
+        console.log('Downloading video...');
+        downloadPromises.push(
+          downloadFile(v.url, videoFile).catch(err => {
+            console.error('Video download with axios failed, trying yt-dlp...');
+            return downloadFileWithYtDlp(v.url, videoFile).catch(ytdlpErr => {
+              console.error('Video download failed with both methods:', ytdlpErr.message);
+              throw new Error(`Video download failed: ${err.message}`);
+            });
+          })
+        );
+        
+        // Download audio (try yt-dlp first as it handles 403 better)
+        console.log('Downloading audio...');
+        downloadPromises.push(
+          downloadFileWithYtDlp(a.url, audioFile).catch(err => {
+            console.error('Audio download with yt-dlp failed, trying axios...');
+            return downloadFile(a.url, audioFile).catch(axiosErr => {
+              console.error('Audio download failed with both methods:', axiosErr.message);
+              throw new Error(`Audio download failed: ${err.message}`);
+            });
+          })
+        );
+        
+        await Promise.all(downloadPromises);
+        console.log('Both video and audio downloaded successfully!');
 
         // Merge the files
         await mergeVideoAudio(videoFile, audioFile, mergedFile);
