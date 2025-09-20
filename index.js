@@ -11,6 +11,10 @@
  */
 
 const { execFile } = require('child_process');
+const axios = require('axios');
+const ffmpeg = require('fluent-ffmpeg');
+const fs = require('fs-extra');
+const path = require('path');
 
 if (process.argv.length < 3) {
   console.error('Usage: node index.js "<bilibili.tv URL>"');
@@ -72,6 +76,72 @@ function pickFormats(formats) {
   return null;
 }
 
+// Download file from URL
+async function downloadFile(url, filePath) {
+  console.log(`Downloading: ${path.basename(filePath)}`);
+  const response = await axios({
+    method: 'GET',
+    url: url,
+    responseType: 'stream',
+    timeout: 300000, // 5 minutes timeout
+  });
+
+  const writer = fs.createWriteStream(filePath);
+  response.data.pipe(writer);
+
+  return new Promise((resolve, reject) => {
+    writer.on('finish', () => {
+      console.log(`Downloaded: ${path.basename(filePath)}`);
+      resolve();
+    });
+    writer.on('error', reject);
+  });
+}
+
+// Merge video and audio using ffmpeg
+async function mergeVideoAudio(videoPath, audioPath, outputPath) {
+  console.log('Merging video and audio...');
+  
+  return new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(videoPath)
+      .input(audioPath)
+      .outputOptions(['-c copy', '-avoid_negative_ts make_zero'])
+      .output(outputPath)
+      .on('start', (commandLine) => {
+        console.log('FFmpeg command:', commandLine);
+      })
+      .on('progress', (progress) => {
+        if (progress.percent) {
+          console.log(`Merging progress: ${Math.round(progress.percent)}%`);
+        }
+      })
+      .on('end', () => {
+        console.log(`Merged video saved: ${path.basename(outputPath)}`);
+        resolve();
+      })
+      .on('error', (err) => {
+        console.error('FFmpeg error:', err.message);
+        reject(err);
+      })
+      .run();
+  });
+}
+
+// Clean up temporary files
+async function cleanupFiles(filePaths) {
+  for (const filePath of filePaths) {
+    try {
+      if (await fs.pathExists(filePath)) {
+        await fs.remove(filePath);
+        console.log(`Cleaned up: ${path.basename(filePath)}`);
+      }
+    } catch (err) {
+      console.warn(`Could not clean up ${filePath}:`, err.message);
+    }
+  }
+}
+
 (async () => {
   try {
     const info = await runYtDlpJSON(url);
@@ -101,7 +171,7 @@ function pickFormats(formats) {
       const v = chosen.video;
       const a = chosen.audio;
 
-      // Suggest file names
+      // Create file names
       const baseTitle = (entry.title || 'bilibili_video')
         .replace(/[\\/:*?"<>|]+/g, '')    // sanitize for filesystem
         .slice(0, 80);
@@ -110,22 +180,58 @@ function pickFormats(formats) {
       const audioFile = `${baseTitle}_audio.${a.ext || 'm4a'}`;
       const mergedFile = `${baseTitle}_720p_merged.mp4`;
 
-      const ffmpegCmd = [
-        'ffmpeg -y',
-        `-i "${v.url}"`,
-        `-i "${a.url}"`,
-        '-c copy',
-        `"${mergedFile}"`
-      ].join(' ');
+      console.log('DASH format detected - downloading and merging video and audio...');
+      console.log(`Video: ${v.height}p, ${v.ext}`);
+      console.log(`Audio: ${a.abr || 'unknown'}kbps, ${a.ext}`);
 
-      const out = {
-        type: 'dash',
-        video: { height: v.height, ext: v.ext, url: v.url },
-        audio: { abr: a.abr || null, ext: a.ext, url: a.url },
-        howToMerge: ffmpegCmd,
-        note: 'Bilibili often serves separate video+audio at 720p. Download both URLs and merge with ffmpeg.'
-      };
-      console.log(JSON.stringify(out, null, 2));
+      const tempFiles = [videoFile, audioFile];
+      
+      try {
+        // Download video and audio files
+        await Promise.all([
+          downloadFile(v.url, videoFile),
+          downloadFile(a.url, audioFile)
+        ]);
+
+        // Merge the files
+        await mergeVideoAudio(videoFile, audioFile, mergedFile);
+
+        // Clean up temporary files
+        await cleanupFiles(tempFiles);
+
+        const out = {
+          type: 'merged',
+          outputFile: mergedFile,
+          video: { height: v.height, ext: v.ext },
+          audio: { abr: a.abr || null, ext: a.ext },
+          note: 'Video and audio have been successfully downloaded and merged!'
+        };
+        console.log('\n' + JSON.stringify(out, null, 2));
+        
+      } catch (error) {
+        console.error('Error during download/merge process:', error.message);
+        
+        // Clean up any partially downloaded files
+        await cleanupFiles(tempFiles);
+        
+        // Fallback: show the manual merge command
+        const ffmpegCmd = [
+          'ffmpeg -y',
+          `-i "${v.url}"`,
+          `-i "${a.url}"`,
+          '-c copy',
+          `"${mergedFile}"`
+        ].join(' ');
+
+        const fallbackOut = {
+          type: 'dash',
+          video: { height: v.height, ext: v.ext, url: v.url },
+          audio: { abr: a.abr || null, ext: a.ext, url: a.url },
+          howToMerge: ffmpegCmd,
+          note: 'Automatic merge failed. You can manually download and merge using the ffmpeg command above.'
+        };
+        console.log('\n' + JSON.stringify(fallbackOut, null, 2));
+      }
     }
   } catch (e) {
     console.error('Error:', e.message);
